@@ -1,0 +1,639 @@
+import sys
+import os
+import pandas as pd
+import json
+from datetime import datetime
+
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QRadioButton, QButtonGroup,
+    QFileDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLineEdit, QComboBox, QCheckBox, QMessageBox, QGroupBox
+)
+from PySide6.QtCore import Qt
+
+from PySide6.QtWidgets import QTableView
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor
+
+PART_COLOR = QColor("#FFF3CD")   # light yellow
+PRICE_COLOR = QColor("#D1ECF1")  # light blue
+
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), "price_updater_config.json")
+
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_config(data):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def sheet_index(choice):
+    return {"First": 0, "Second": 1, "Third": 2}[choice]
+
+def load_table(path, sheet=None, max_scan_rows=5):
+    ext = os.path.splitext(path)[1].lower()
+
+    def detect_header_row(df_preview):
+        for i in range(len(df_preview)):
+            row = df_preview.iloc[i].astype(str).str.strip().str.lower()
+            if "material" in row.values:
+                return i
+        return None
+
+    # ---------- CSV ----------
+    if ext == ".csv":
+        for encoding in ("utf-8", "latin1"):
+            try:
+                preview = pd.read_csv(
+                    path,
+                    header=None,
+                    nrows=max_scan_rows,
+                    encoding=encoding,
+                    engine="python",
+                    dtype=str
+                )
+
+                header_row = detect_header_row(preview)
+
+                return pd.read_csv(
+                    path,
+                    header=header_row if header_row is not None else 0,
+                    encoding=encoding,
+                    engine="python",
+                    dtype=str
+                )
+
+            except UnicodeDecodeError:
+                continue
+
+        raise UnicodeDecodeError(
+            "Unable to decode CSV file using utf-8 or latin1",
+            path,
+            0,
+            0,
+            "encoding failure"
+        )
+
+    # ---------- Excel ----------
+    else:
+        preview = pd.read_excel(
+            path,
+            sheet_name=sheet,
+            header=None,
+            nrows=max_scan_rows,
+            dtype=str
+        )
+
+        header_row = detect_header_row(preview)
+
+        return pd.read_excel(
+            path,
+            sheet_name=sheet,
+            header=header_row if header_row is not None else 0,
+            dtype=str
+        )
+
+
+def save_table(df, path):
+    if path.lower().endswith(".csv"):
+        df.to_csv(path, index=False)
+    else:
+        df.to_excel(path, index=False)
+
+def normalize_part(x):
+    if pd.isna(x):
+        return None
+    return str(x).replace("\xa0", "").strip().upper()
+
+
+
+def find_unusable_reference_prices(ref_df):
+    """
+    Returns a DataFrame of reference rows where Material exists
+    but Total Pr is missing or NaN.
+    """
+    bad = ref_df[
+        ref_df["Material_norm"].notna() &
+        ref_df["Material_norm"].ne("") &
+        ref_df["Total Pr"].isna()
+    ]
+    return bad
+
+
+def populate_tableview(view: QTableView, df: pd.DataFrame,
+                       part_col=None, price_col=None,
+                       max_rows=6, max_cols=6):
+
+    model = QStandardItemModel()
+
+    df = df.iloc[:max_rows, :max_cols]
+
+    model.setColumnCount(len(df.columns))
+    model.setHorizontalHeaderLabels(df.columns.astype(str).tolist())
+
+    for r_idx, row in df.iterrows():
+        items = []
+        for c_idx, value in enumerate(row):
+            item = QStandardItem("" if pd.isna(value) else str(value))
+
+            col_name = df.columns[c_idx]
+
+            if part_col and col_name == part_col:
+                item.setBackground(PART_COLOR)
+
+            if price_col and col_name == price_col:
+                item.setBackground(PRICE_COLOR)
+
+            items.append(item)
+
+        model.appendRow(items)
+
+    view.setModel(model)
+    view.resizeColumnsToContents()
+
+
+# -------------------------------------------------
+# Main Window
+# -------------------------------------------------
+class PriceUpdater(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Agilent Genomics Price Updater")
+        self.setFixedSize(1280, 720)
+
+        self.ref_file = None
+        self.input_path = None
+        self.output_folder = None
+
+        self.build_ui()
+        self.load_previous_config()
+
+    # -------------------------------------------------
+    # UI Construction
+    # -------------------------------------------------
+    def build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        layout.addWidget(self.reference_group())
+        layout.addWidget(self.input_group())
+        layout.addWidget(self.output_group())
+        layout.addWidget(self.preview_group())
+        layout.addWidget(self.matching_group())
+        layout.addWidget(self.action_group())
+        layout.addStretch()
+
+    def load_previous_config(self):
+        cfg = load_config()
+
+        if "reference_file" in cfg and os.path.exists(cfg["reference_file"]):
+            self.ref_file = cfg["reference_file"]
+            self.ref_path.setText(cfg["reference_file"])
+
+        if "reference_sheet" in cfg:
+            idx = self.ref_sheet.findText(cfg["reference_sheet"])
+            if idx >= 0:
+                self.ref_sheet.setCurrentIndex(idx)
+
+        if "last_output_folder" in cfg and os.path.exists(cfg["last_output_folder"]):
+            self.output_folder = cfg["last_output_folder"]
+            self.output_path_display.setText(cfg["last_output_folder"])
+
+    # ---------------- Reference ----------------
+    def reference_group(self):
+        box = QGroupBox("Reference Price File")
+        grid = QGridLayout(box)
+
+        btn = QPushButton("Select Reference File (CSV or Excel file)")
+        btn.clicked.connect(self.select_reference)
+
+        self.ref_path = QLineEdit()
+        self.ref_path.setReadOnly(True)
+
+        self.ref_sheet = QComboBox()
+        self.ref_sheet.addItems(["First", "Second", "Third"])
+
+        grid.addWidget(btn, 0, 0)
+        grid.addWidget(self.ref_path, 0, 1, 1, 3)
+        grid.addWidget(QLabel("Specify Worksheet in Excel file"), 1, 0)
+        grid.addWidget(self.ref_sheet, 1, 1)
+
+        return box
+
+    # ---------------- Input ----------------
+    def input_group(self):
+        box = QGroupBox("Input Source")
+        grid = QGridLayout(box)
+
+        # --- Radio buttons ---
+        self.input_mode_group = QButtonGroup(self)
+
+        self.rb_input_file = QRadioButton("Select a File (CSV or Excel file)")
+        self.rb_input_folder = QRadioButton("Select a Folder")
+
+        self.rb_input_file.setChecked(True)
+
+        self.input_mode_group.addButton(self.rb_input_file)
+        self.input_mode_group.addButton(self.rb_input_folder)
+
+        # --- Browse button ---
+        btn = QPushButton("Browse")
+        btn.clicked.connect(self.select_input)
+
+        self.input_path_display = QLineEdit()
+        self.input_path_display.setReadOnly(True)
+
+        self.input_sheet = QComboBox()
+        self.input_sheet.addItems(["First", "Second", "Third"])
+
+        # --- Layout ---
+        grid.addWidget(self.rb_input_file, 0, 0)
+        grid.addWidget(self.rb_input_folder, 0, 1)
+        grid.addWidget(btn, 0, 2)
+
+        grid.addWidget(self.input_path_display, 1, 0, 1, 3)
+
+        grid.addWidget(QLabel("Specify Worksheet in Excel file"), 2, 0)
+        grid.addWidget(self.input_sheet, 2, 1)
+
+        return box
+
+    # ---------------- Output ----------------
+    def output_group(self):
+        box = QGroupBox("Output Options")
+        grid = QGridLayout(box)
+
+        btn = QPushButton("Select Output Folder")
+        btn.clicked.connect(self.select_output)
+
+        self.output_path_display = QLineEdit()
+        self.output_path_display.setReadOnly(True)
+
+        self.overwrite_cb = QCheckBox("Overwrite Existing Files (Suitable for NGS Search App etc)")
+        self.new_price_cb = QCheckBox("Add New Price Column (\"New Price\")")
+
+        grid.addWidget(btn, 0, 0)
+        grid.addWidget(self.output_path_display, 0, 1, 1, 3)
+        grid.addWidget(self.overwrite_cb, 1, 0)
+        grid.addWidget(self.new_price_cb, 1, 1)
+
+        return box
+
+    def preview_group(self):
+        box = QGroupBox("Preview Files")
+        layout = QVBoxLayout(box)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        self.preview_ref_btn = QPushButton("Preview Reference File")
+        self.preview_ref_btn.clicked.connect(self.preview_reference)
+
+        self.preview_input_btn = QPushButton("Preview Input File")
+        self.preview_input_btn.clicked.connect(self.preview_input)
+
+        btn_layout.addWidget(self.preview_ref_btn)
+        btn_layout.addWidget(self.preview_input_btn)
+        btn_layout.addStretch()
+
+        # Side-by-side views
+        view_layout = QHBoxLayout()
+
+        self.ref_preview = QTableView()
+        self.input_preview = QTableView()
+
+        self.ref_preview.setMinimumHeight(180)
+        self.input_preview.setMinimumHeight(180)
+
+        view_layout.addWidget(self.ref_preview)
+        view_layout.addWidget(self.input_preview)
+
+        layout.addLayout(btn_layout)
+        layout.addLayout(view_layout)
+
+        return box
+
+    # ---------------- Matching ----------------
+    def matching_group(self):
+        box = QGroupBox("Column Matching")
+        grid = QGridLayout(box)
+
+        # Reference side
+        grid.addWidget(QLabel("Reference"), 0, 0, alignment=Qt.AlignCenter)
+        grid.addWidget(QLabel("Material"), 1, 0)
+        grid.addWidget(QLabel("Total Pr"), 2, 0)
+
+        # Divider
+        divider = QLabel("|")
+        divider.setAlignment(Qt.AlignCenter)
+        grid.addWidget(divider, 1, 1, 2, 1)
+
+        # Input side
+        grid.addWidget(QLabel("Input"), 0, 2, alignment=Qt.AlignCenter)
+
+        self.part_dropdown = QComboBox()
+        self.part_dropdown.addItems(["Material", "Part Number", "Custom"])
+        self.part_custom = QLineEdit()
+        self.part_custom.setEnabled(False)
+
+        self.price_dropdown = QComboBox()
+        self.price_dropdown.addItems(["Total Pr", "Price", "Custom"])
+        self.price_custom = QLineEdit()
+        self.price_custom.setEnabled(False)
+
+        self.part_dropdown.currentTextChanged.connect(
+            lambda v: self.part_custom.setEnabled(v == "Custom"))
+        self.price_dropdown.currentTextChanged.connect(
+            lambda v: self.price_custom.setEnabled(v == "Custom"))
+
+        grid.addWidget(self.part_dropdown, 1, 2)
+        grid.addWidget(self.part_custom, 1, 3)
+
+        grid.addWidget(self.price_dropdown, 2, 2)
+        grid.addWidget(self.price_custom, 2, 3)
+
+        return box
+
+    # ---------------- Actions ----------------
+    def action_group(self):
+        box = QGroupBox("Actions")
+        layout = QHBoxLayout(box)
+
+        self.status_label = QLabel("Ready")
+
+        btn_check = QPushButton("Check Unmatched Parts")
+        btn_check.clicked.connect(self.check_unmatched)
+
+        btn_run = QPushButton("RUN PRICE UPDATE")
+        btn_run.setFixedHeight(40)
+        btn_run.clicked.connect(self.run_update)
+
+        layout.addWidget(btn_check)
+        layout.addWidget(btn_run)
+        layout.addStretch()
+        layout.addWidget(self.status_label)
+
+        return box
+
+    # -------------------------------------------------
+    # File dialogs
+    # -------------------------------------------------
+    def select_reference(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Reference File", "","CSV / Excel (*.csv *.xlsx)")
+        if path:
+            self.ref_file = path
+            self.ref_path.setText(path)
+
+            cfg = load_config()
+            cfg["reference_file"] = path
+            cfg["reference_sheet"] = self.ref_sheet.currentText()
+            save_config(cfg)
+
+    def select_input(self):
+        if self.rb_input_file.isChecked():
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Input File",
+                "",
+                "CSV / Excel (*.csv *.xlsx)"
+            )
+        else:
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Select Input Folder"
+            )
+
+        if path:
+            self.input_path = path
+            self.input_path_display.setText(path)
+
+    def select_output(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if path:
+            self.output_folder = path
+            self.output_path_display.setText(path)
+
+            cfg = load_config()
+            cfg["last_output_folder"] = path
+            save_config(cfg)
+
+    def preview_reference(self):
+        if not self.ref_file:
+            QMessageBox.warning(self, "Missing Reference", "Please select a reference file first.")
+            return
+
+        df = load_table(
+            self.ref_file,
+            sheet_index(self.ref_sheet.currentText())
+        )
+
+        part_col = "Material" if "Material" in df.columns else None
+        price_col = "Total Pr" if "Total Pr" in df.columns else None
+
+        populate_tableview(
+            self.ref_preview,
+            df,
+            part_col=part_col,
+            price_col=price_col
+        )
+
+    def preview_input(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Input File for Preview", "", "CSV / Excel (*.csv *.xlsx)"
+        )
+        if not path:
+            return
+
+        df = load_table(
+            path,
+            sheet_index(self.input_sheet.currentText())
+        )
+
+        # Detect likely columns
+        part_col = None
+        price_col = None
+
+        for c in df.columns:
+            lc = c.lower()
+            if lc in ("material", "part number") and part_col is None:
+                part_col = c
+            if lc in ("total pr", "price") and price_col is None:
+                price_col = c
+
+        populate_tableview(
+            self.input_preview,
+            df,
+            part_col=part_col,
+            price_col=price_col
+        )
+
+    # -------------------------------------------------
+    # Core Logic
+    # -------------------------------------------------
+    def resolve_column(self, dropdown, custom):
+        return custom.text() if dropdown.currentText() == "Custom" else dropdown.currentText()
+
+    def check_unmatched(self):
+        ref_df = load_table(self.ref_file, sheet_index(self.ref_sheet.currentText()))
+
+        if "Total Pr" in ref_df.columns:
+            ref_df["Total Pr"] = (
+                ref_df["Total Pr"]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+            )
+            ref_df["Total Pr"] = pd.to_numeric(ref_df["Total Pr"], errors="coerce")
+
+        ref_parts = set(ref_df["Material"].apply(normalize_part))
+
+
+        files = self.collect_input_files()
+        unmatched = set()
+
+        part_col = self.resolve_column(self.part_dropdown, self.part_custom)
+
+        for f in files:
+            df = load_table(f, sheet_index(self.input_sheet.currentText()))
+            if part_col not in df.columns:
+                continue
+            unmatched |= (
+                    set(df[part_col].apply(normalize_part)) - ref_parts
+            )
+
+        if unmatched:
+            self.status_label.setText("⚠ Unmatched part numbers detected")
+            out_dir = QFileDialog.getExistingDirectory(self, "Save Unmatched Report")
+            if out_dir:
+                pd.DataFrame({"Unmatched Part Number": sorted(unmatched)}).to_csv(
+                    os.path.join(out_dir, "unmatched_part_numbers.csv"), index=False)
+        else:
+            self.status_label.setText("✓ No unmatched part numbers")
+
+    def collect_input_files(self):
+        if os.path.isdir(self.input_path):
+            return [
+                os.path.join(self.input_path, f)
+                for f in os.listdir(self.input_path)
+                if f.endswith((".csv", ".xlsx"))
+            ]
+        return [self.input_path]
+
+    def run_update(self):
+        if not self.input_path:
+            QMessageBox.warning(
+                self,
+                "Missing Input",
+                "Please select an input file or folder before running the update."
+            )
+            return
+
+        ref_df = load_table(self.ref_file, sheet_index(self.ref_sheet.currentText()))
+        # --- Normalize reference part numbers and price ---
+        ref_df["Material_norm"] = ref_df["Material"].apply(normalize_part)
+
+        if "Total Pr" in ref_df.columns:
+            ref_df["Total Pr"] = (
+                ref_df["Total Pr"]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+            )
+            ref_df["Total Pr"] = pd.to_numeric(ref_df["Total Pr"], errors="coerce")
+
+        ref_map = dict(
+            zip(ref_df["Material_norm"], ref_df["Total Pr"])
+        )
+
+        # --- Detect unusable reference prices ---
+        bad_ref = find_unusable_reference_prices(ref_df)
+
+        if not bad_ref.empty:
+            # --- Export bad reference rows ---
+            ref_dir = os.path.dirname(self.ref_file)
+            date_str = datetime.now().strftime("%Y%m%d")
+            bad_ref_path = os.path.join(ref_dir, f"{date_str}_bad_ref_rows.csv")
+
+            # Drop helper columns if you do not want to expose them
+            export_cols = [c for c in bad_ref.columns if not c.endswith("_norm")]
+            bad_ref[export_cols].to_csv(bad_ref_path, index=False)
+
+            reply = QMessageBox.question(
+                self,
+                "Unusable Reference Prices Detected",
+                f"{len(bad_ref)} reference rows have missing or invalid prices.\n\n"
+                "Those parts will NOT update input prices.\n\n"
+                "It is recommended to fix the reference file before proceeding.\n\n"
+                "Do you want to continue anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                QMessageBox.information(
+                    self,
+                    "Update Aborted",
+                    "Price update was cancelled. No files were modified."
+                )
+                return
+
+        part_col = self.resolve_column(self.part_dropdown, self.part_custom)
+        price_col = self.resolve_column(self.price_dropdown, self.price_custom)
+
+        for f in self.collect_input_files():
+            df = load_table(f, sheet_index(self.input_sheet.currentText()))
+
+            # --- Normalize input part numbers ---
+            df["_part_norm"] = df[part_col].apply(normalize_part)
+
+            new_prices = df["_part_norm"].map(ref_map)
+
+            if self.new_price_cb.isChecked():
+                # --- Insert New Price column next to existing price column ---
+                if price_col in df.columns:
+                    insert_at = df.columns.get_loc(price_col) + 1
+
+                    # Remove existing "New Price" if user reruns
+                    if "New Price" in df.columns:
+                        df.drop(columns=["New Price"], inplace=True)
+
+                    df.insert(insert_at, "New Price", new_prices)
+                else:
+                    # Fallback: append to end if price column not found
+                    df["New Price"] = new_prices
+            else:
+                df[price_col] = new_prices.fillna(df[price_col])
+
+
+            # Optional cleanup
+            df.drop(columns=["_part_norm"], inplace=True)
+
+            if self.overwrite_cb.isChecked():
+                # --- Overwrite original file ---
+                save_table(df, f)
+            else:
+                # --- Always create a new file with YYYYMMDD suffix ---
+                date_str = datetime.now().strftime("%Y%m%d")
+                base, ext = os.path.splitext(os.path.basename(f))
+
+                out_name = f"{base}_{date_str}{ext}"
+                out_path = os.path.join(self.output_folder, out_name)
+
+                save_table(df, out_path)
+
+        QMessageBox.information(self, "Completed", "Price update completed successfully.")
+
+# -------------------------------------------------
+# Entry
+# -------------------------------------------------
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = PriceUpdater()
+    w.show()
+    sys.exit(app.exec())
